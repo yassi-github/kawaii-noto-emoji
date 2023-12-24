@@ -1,0 +1,127 @@
+name: Update
+
+on:
+  schedule:
+    - cron: '34 3 * * *'
+
+env:
+  UPSTREAM_REPO: "googlefonts/noto-emoji"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: git setup
+        run: |
+          git config --local user.name "${GITHUB_ACTOR}"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+
+      - name: update check
+        id: check-update
+        run: |
+          git fetch --quiet --tags upstream ${GITHUB_REF_NAME}
+          git reset --hard HEAD^
+          COMMIT_COUNT_LOCAL="$(git rev-list --count ${GITHUB_REF_NAME})"
+          LATEST_TAG_LOCAL="$(git describe --abbrev=0 --tags)"
+          git rebase upstream/main
+          COMMIT_COUNT_UPSTREAM="$(git rev-list --count ${GITHUB_REF_NAME})"
+          LATEST_TAG_UPSTREAM="$(git describe --abbrev=0 --tags)"
+          KAWAII_LATEST_TAG="k-$(git describe --abbrev=0 --tags)"
+          if [ "${COMMIT_COUNT_UPSTREAM}" = "${COMMIT_COUNT_LOCAL}" ]; then
+            echo "No Update Found."
+            echo "UPDATE_STATUS=abort" >> ${GITHUB_OUTPUT}
+            # early exit
+            exit 0
+          fi
+          if [ "${LATEST_TAG_UPSTREAM}" = "${LATEST_TAG_LOCAL}" ]; then
+            echo "Updating branch but version update not detected."
+            echo "name=UPDATE_STATUS=usual" >> ${GITHUB_OUTPUT}
+          else
+            echo "Version update detected."
+            echo "UPDATE_STATUS=release" >> ${GITHUB_OUTPUT}
+            echo "LATEST_TAG_UPSTREAM=${LATEST_TAG_UPSTREAM}" >> ${GITHUB_OUTPUT}
+            echo "KAWAII_LATEST_TAG=${KAWAII_LATEST_TAG}" >> ${GITHUB_OUTPUT}
+            LATESTTAG_NEXT_HASH=$(git log --format=%H | grep -B1 "$(git log --no-walk --tags --pretty="%d,%H" --abbrev-commit |grep "tag: ${LATEST_TAG_UPSTREAM}" | cut -d',' -f2)" | head -1)
+            git rebase --onto=${LATEST_TAG_UPSTREAM} ${LATESTTAG_NEXT_HASH} HEAD
+          fi
+
+      # overwrite pngs every update
+      # upstreamCommits -> addThisWorkflow -> pngOverwrite <- HEAD
+      - name: restore kawaii png
+        if: (steps.check-update.outputs.UPDATE_STATUS != 'abort')
+        run: |
+          git reset --hard e456654119cc3a5f9bebb7bbd00512456f983d2d
+          rsync -a --copy-links png/128/ ~/png/
+          git reset --hard HEAD@{1}
+          rsync -a --copy-links ~/png/ png/128/
+          git commit --quiet -a -m "kawaii: restore png"
+          # remove untracked files
+          git clean -df
+          git remote set-url origin "https://${{ secrets.PAT }}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force-with-lease origin ${GITHUB_REF_NAME}
+          git tag -a ${{ steps.check-update.outputs.KAWAII_LATEST_TAG }} -m "kawaii version from ${{ steps.check-update.outputs.LATEST_TAG_UPSTREAM }}" HEAD
+          git push --tags
+
+      # release
+      - name: prepare build CBDT ttf to release
+        if: (steps.check-update.outputs.UPDATE_STATUS == 'release')
+        run: |
+          # bypass old (ubuntu trusty) imgmagick command (see: Makefile comment)
+          cat <<"EOF" | sudo tee /usr/local/bin/convert
+          #!/bin/sh
+          ARGS="${@}"
+          docker run -i --rm \
+              -v $(realpath "${PWD}"):${PWD} \
+              -w $(realpath "${PWD}") \
+              ghcr.io/yassi-github/imagemagick:trusty \
+              sh -c "convert ${ARGS} && chown $(id -u) ./* ; chgrp $(id -g) ./*"
+          EOF
+          sudo chmod +x /usr/local/bin/convert
+          sudo apt update
+          sudo apt install -y python3-venv zopfli pkg-config libcairo2-dev build-essential
+
+      - name: Log in to the Container registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: build CBDT ttf to release
+        if: (steps.check-update.outputs.UPDATE_STATUS == 'release')
+        run: |
+          rm -rf venv  # in case you have an old borked venv!
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+          # resize invalid png (kawaii png has invalid sized like 127x128)
+          find png/128/ -type f | xargs -P$(cat /proc/cpuinfo | grep "^processor\s\+:" | wc -l) -I{} convert -resize 128x128! {} {}
+          python size_check.py
+          rm -rf build/ && time make -j 48
+          # Should take 2-3 minutes to create noto-emoji/NotoColorEmoji.ttf
+          mv *.ttf fonts/
+
+      - name: move HEAD to TAG to release
+        if: (steps.check-update.outputs.UPDATE_STATUS == 'release')
+        run: |
+          git reset --soft ${{ steps.check-update.outputs.LATEST_TAG_UPSTREAM }}
+
+      - name: Release
+        if: (steps.check-update.outputs.UPDATE_STATUS == 'release')
+        uses: softprops/action-gh-release@v1
+        with:
+          body: |
+            kawaii version ttf files
+            based on upstream (https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.check-update.outputs.LATEST_TAG_UPSTREAM }})
+          tag_name: ${{ steps.check-update.outputs.KAWAII_LATEST_TAG }}
+          files: |
+            fonts/NotoColorEmoji.ttf
+            fonts/NotoColorEmoji_WindowsCompatible.ttf
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
